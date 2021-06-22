@@ -3,6 +3,7 @@
 # Error codes:
 # http://dev.mysql.com/doc/refman/5.5/en/error-messages-client.html
 from __future__ import print_function
+
 from ._compat import PY2, range_type, text_type, str_type, JYTHON, IRONPYTHON
 
 import errno
@@ -99,13 +100,12 @@ sha_new = partial(hashlib.new, 'sha1')
 NULL_COLUMN = 251
 UNSIGNED_CHAR_COLUMN = 251
 UNSIGNED_SHORT_COLUMN = 252
-UNSIGNED_INT24_COLUMN = 253
+UNSIGNED_INT32_COLUMN = 253
 UNSIGNED_INT64_COLUMN = 254
 
 DEFAULT_CHARSET = 'latin1'
 
 MAX_PACKET_LEN = 2**24-1
-
 
 def dump_packet(data): # pragma: no cover
     def is_ascii(data):
@@ -303,6 +303,25 @@ class MysqlPacket(object):
         self._position += 8
         return result
 
+    def read_data_field_formatted_integer(self):
+        """Read a 'Length Coded integer' number from the data buffer."""
+
+        c = self.read_length_encoded_integer()
+        if c is None:
+            return None
+
+        if c == 1:
+            return self.read_uint8()
+        elif c == 2:
+            return self.read_uint16()
+        elif c == 3:
+            return self.read_uint24()
+        elif c == 4:
+            return self.read_uint32()
+        elif c == 8:
+            return self.read_uint64()
+
+
     def read_length_encoded_integer(self):
         """Read a 'Length Coded Binary' number from the data buffer.
 
@@ -316,14 +335,13 @@ class MysqlPacket(object):
             return c
         elif c == UNSIGNED_SHORT_COLUMN:
             return self.read_uint16()
-        elif c == UNSIGNED_INT24_COLUMN:
-            return self.read_uint24()
+        elif c == UNSIGNED_INT32_COLUMN:
+            return self.read_uint32()
         elif c == UNSIGNED_INT64_COLUMN:
             return self.read_uint64()
 
     def read_length_coded_string(self):
         """Read a 'Length Coded String' from the data buffer.
-
         A 'Length Coded String' consists first of a length coded
         (unsigned, positive) integer represented in 1-9 bytes followed by
         that many bytes of binary data.  (For example "cat" would be "3cat".)
@@ -335,7 +353,10 @@ class MysqlPacket(object):
 
     def read_struct(self, fmt):
         s = struct.Struct(fmt)
+        try:
         result = s.unpack_from(self._data, self._position)
+        except:
+            return None
         self._position += s.size
         return result
 
@@ -419,6 +440,38 @@ class FieldDescriptorPacket(MysqlPacket):
                 % (self.__class__, self.db, self.table_name, self.name,
                    self.type_code, self.flags))
 
+class FieldDescriptorPacket_Pre41(FieldDescriptorPacket):
+    def __init__(self, data, encoding):
+        MysqlPacket.__init__(self, data, encoding)
+        self.__parse_field_descriptor(encoding)
+
+    def __parse_field_descriptor(self, encoding):
+        """Parse the 'Field Descriptor' (Metadata) packet.
+
+        This is compatible with MySQL 4.0.
+        """
+        #self.catalog = self.read_length_coded_string()
+        #self.db = self.read_length_coded_string()
+        self.table_name = self.read_length_coded_string().decode(encoding)
+        #self.org_table = self.read_length_coded_string().decode(encoding)
+        self.name = self.read_length_coded_string().decode(encoding)
+        #self.org_name = self.read_length_coded_string().decode(encoding)
+        self.length = self.read_data_field_formatted_integer()
+        self.type_code = self.read_data_field_formatted_integer()
+        self.read_uint8()
+
+        self.flags = self.read_uint16()
+        self.scale = self.read_uint8()
+        # 'default' is a length coded binary and is still in the buffer?
+        # not used for normal result sets...
+        #self.charsetnr = 8
+
+        self.charsetnr = charset_by_name(encoding).id
+
+    def __str__(self):
+        return ('%s %r.%r, type=%d, flags=%x length=%d'
+                % (self.__class__, self.table_name, self.name,
+                   self.type_code, self.flags, self.length))
 
 class OKPacketWrapper(object):
     """
@@ -444,6 +497,26 @@ class OKPacketWrapper(object):
     def __getattr__(self, key):
         return getattr(self.packet, key)
 
+class OKPacketWrapper_pre41(OKPacketWrapper):
+    def __init__(self, from_packet):
+        if not from_packet.is_ok_packet():
+            raise ValueError('Cannot create ' + str(self.__class__.__name__) +
+                             ' object from invalid packet type')
+
+        self.packet = from_packet
+        self.packet.advance(1)
+
+        self.affected_rows = self.packet.read_length_encoded_integer()
+        self.insert_id = self.packet.read_length_encoded_integer()
+        length = len(self.packet._data)
+
+        self.server_status = 0
+        self.warning_count = 0
+        if length > self.packet._position:
+            self.server_status = self.read_struct('<H')
+        self.message = self.packet.read_all()
+        self.has_next = self.server_status & SERVER_STATUS.SERVER_MORE_RESULTS_EXISTS
+
 
 class EOFPacketWrapper(object):
     """
@@ -466,6 +539,17 @@ class EOFPacketWrapper(object):
     def __getattr__(self, key):
         return getattr(self.packet, key)
 
+class EOFPacketWrapper_pre41(EOFPacketWrapper):
+    def __init__(self, from_packet):
+        if not from_packet.is_eof_packet():
+            raise ValueError(
+                "Cannot create '{0}' object from invalid packet type".format(
+                    self.__class__))
+
+        self.warning_count = 0
+        self.server_status = 0
+
+        self.has_next = self.server_status & SERVER_STATUS.SERVER_MORE_RESULTS_EXISTS
 
 class LoadLocalPacketWrapper(object):
     """
@@ -651,6 +735,7 @@ class Connection(object):
         self.sql_mode = sql_mode
         self.init_command = init_command
         self.max_allowed_packet = max_allowed_packet
+        self.pre41 = False
         if defer_connect:
             self.socket = None
         else:
@@ -685,6 +770,9 @@ class Connection(object):
         self._rfile = None
 
     def autocommit(self, value):
+        if self.pre41:
+            self.autocommit_mode = False
+            return
         self.autocommit_mode = bool(value)
         current = self.get_autocommit()
         if value != current:
@@ -698,6 +786,10 @@ class Connection(object):
         pkt = self._read_packet()
         if not pkt.is_ok_packet():
             raise err.OperationalError(2014, "Command Out of Sync")
+        ok = ""
+        if self.pre41:
+            ok = OKPacketWrapper_pre41(pkt)
+        else:
         ok = OKPacketWrapper(pkt)
         self.server_status = ok.server_status
         return ok
@@ -987,6 +1079,9 @@ class Connection(object):
             seq_id += 1
 
     def _request_authentication(self):
+        if self.pre41:
+            return self._request_authentication_Pre41()
+
         self.client_flag |= CLIENT.CAPABILITIES
         if int(self.server_version.split('.', 1)[0]) >= 5:
             self.client_flag |= CLIENT.MULTI_RESULTS
@@ -1043,6 +1138,60 @@ class Connection(object):
             self._write_bytes(data)
             auth_packet = self._read_packet()
 
+    def _request_authentication_Pre41(self):
+        self.client_flag = CLIENT.CAPABILITIES_PRE41
+
+        if self.user is None:
+            raise ValueError("Did not specify a username")
+
+        if isinstance(self.user, text_type):
+            self.user = self.user.encode(self.encoding)
+
+        data_init = struct.pack('<HBH', self.client_flag, 0, 0)
+
+        next_packet = 1
+
+        if self.ssl:
+            data = pack_int24(len(data_init)) + int2byte(next_packet) + data_init
+            next_packet += 1
+
+            if DEBUG: dump_packet(data)
+            self._write_bytes(data)
+
+            cert_reqs = ssl.CERT_NONE if self.ca is None else ssl.CERT_REQUIRED
+            self.socket = ssl.wrap_socket(self.socket, keyfile=self.key,
+                                          certfile=self.cert,
+                                          ssl_version=ssl.PROTOCOL_TLSv1,
+                                          cert_reqs=cert_reqs,
+                                          ca_certs=self.ca)
+            self._rfile = _makefile(self.socket, 'rb')
+
+        data = data_init + self.user + b'\0' + \
+            _scramble_323(self.password.encode('latin1'), self.salt)
+
+        if self.db:
+            if isinstance(self.db, text_type):
+                self.db = self.db.encode(self.encoding)
+            data += int2byte(0) + self.db 
+
+        data = pack_int24(len(data)) + int2byte(next_packet) + data
+        next_packet += 2
+
+        if DEBUG: dump_packet(data)
+        self._write_bytes(data)
+
+        auth_packet = self._read_packet()
+
+        # if old_passwords is enabled the packet will be 1 byte long and
+        # have the octet 254
+
+        if auth_packet.is_eof_packet():
+            # send legacy handshake
+            data = _scramble_323(self.password.encode('latin1'), self.salt) + b'\0'
+            data = pack_int24(len(data)) + int2byte(next_packet) + data
+            self._write_bytes(data)
+            auth_packet = self._read_packet()
+
     # _mysql support
     def thread_id(self):
         return self.server_thread_id[0]
@@ -1069,6 +1218,8 @@ class Connection(object):
         self.server_version = data[i:server_end].decode('latin1')
         i = server_end + 1
 
+        self.pre41 = float(self.server_version[0:3]) <= 4.1
+
         self.server_thread_id = struct.unpack('<I', data[i:i+4])
         i += 4
 
@@ -1083,6 +1234,9 @@ class Connection(object):
             i += 6
             self.server_language = lang
             self.server_charset = charset_by_id(lang).name
+
+            self.charset = self.server_charset
+            self.encoding = charset_by_name(self.charset).encoding
 
             self.server_status = stat
             if DEBUG: print("server_status: %x" % stat)
@@ -1164,6 +1318,10 @@ class MySQLResult(object):
             self.affected_rows = 18446744073709551615
 
     def _read_ok_packet(self, first_packet):
+        ok_packet = ""
+        if self.connection.pre41:
+            ok_packet = OKPacketWrapper_pre41(first_packet)
+        else:
         ok_packet = OKPacketWrapper(first_packet)
         self.affected_rows = ok_packet.affected_rows
         self.insert_id = ok_packet.insert_id
@@ -1183,7 +1341,11 @@ class MySQLResult(object):
         self._read_ok_packet(ok_packet)
 
     def _check_packet_is_eof(self, packet):
+        eof_packet = ""
         if packet.is_eof_packet():
+            if self.connection.pre41:
+                eof_packet = EOFPacketWrapper_pre41(packet)
+            else:
             eof_packet = EOFPacketWrapper(packet)
             self.warning_count = eof_packet.warning_count
             self.has_next = eof_packet.has_next
@@ -1255,8 +1417,15 @@ class MySQLResult(object):
         self.converters = []
         use_unicode = self.connection.use_unicode
         description = []
+        packet_type = None
+
+        if self.connection.pre41:
+            packet_type = FieldDescriptorPacket_Pre41
+        else:
+            packet_type = FieldDescriptorPacket
+        
         for i in range_type(self.field_count):
-            field = self.connection._read_packet(FieldDescriptorPacket)
+            field = self.connection._read_packet(packet_type)
             self.fields.append(field)
             description.append(field.description())
             field_type = field.type_code
