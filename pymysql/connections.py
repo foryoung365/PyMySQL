@@ -100,7 +100,7 @@ sha_new = partial(hashlib.new, 'sha1')
 NULL_COLUMN = 251
 UNSIGNED_CHAR_COLUMN = 251
 UNSIGNED_SHORT_COLUMN = 252
-UNSIGNED_INT32_COLUMN = 253
+UNSIGNED_INT24_COLUMN = 253
 UNSIGNED_INT64_COLUMN = 254
 
 DEFAULT_CHARSET = 'latin1'
@@ -335,11 +335,11 @@ class MysqlPacket(object):
             return c
         elif c == UNSIGNED_SHORT_COLUMN:
             return self.read_uint16()
-        elif c == UNSIGNED_INT32_COLUMN:
-            return self.read_uint32()
+        elif c == UNSIGNED_INT24_COLUMN:
+            return self.read_uint24()
         elif c == UNSIGNED_INT64_COLUMN:
             return self.read_uint64()
-
+            
     def read_length_coded_string(self):
         """Read a 'Length Coded String' from the data buffer.
         A 'Length Coded String' consists first of a length coded
@@ -354,7 +354,7 @@ class MysqlPacket(object):
     def read_struct(self, fmt):
         s = struct.Struct(fmt)
         try:
-        result = s.unpack_from(self._data, self._position)
+            result = s.unpack_from(self._data, self._position)
         except:
             return None
         self._position += s.size
@@ -513,7 +513,7 @@ class OKPacketWrapper_pre41(OKPacketWrapper):
         self.server_status = 0
         self.warning_count = 0
         if length > self.packet._position:
-            self.server_status = self.read_struct('<H')
+            self.server_status = self.read_struct('<H')[0]
         self.message = self.packet.read_all()
         self.has_next = self.server_status & SERVER_STATUS.SERVER_MORE_RESULTS_EXISTS
 
@@ -790,7 +790,7 @@ class Connection(object):
         if self.pre41:
             ok = OKPacketWrapper_pre41(pkt)
         else:
-        ok = OKPacketWrapper(pkt)
+            ok = OKPacketWrapper(pkt)
         self.server_status = ok.server_status
         return ok
 
@@ -1322,7 +1322,7 @@ class MySQLResult(object):
         if self.connection.pre41:
             ok_packet = OKPacketWrapper_pre41(first_packet)
         else:
-        ok_packet = OKPacketWrapper(first_packet)
+            ok_packet = OKPacketWrapper(first_packet)
         self.affected_rows = ok_packet.affected_rows
         self.insert_id = ok_packet.insert_id
         self.server_status = ok_packet.server_status
@@ -1346,7 +1346,7 @@ class MySQLResult(object):
             if self.connection.pre41:
                 eof_packet = EOFPacketWrapper_pre41(packet)
             else:
-            eof_packet = EOFPacketWrapper(packet)
+                eof_packet = EOFPacketWrapper(packet)
             self.warning_count = eof_packet.warning_count
             self.has_next = eof_packet.has_next
             return True
